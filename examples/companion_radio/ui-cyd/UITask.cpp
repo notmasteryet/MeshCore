@@ -1126,11 +1126,14 @@ void UITask::buildHome() {
   lv_obj_set_style_text_font(bl, &inter_10, 0);
   label(sb, I_BATT[pct > 87 ? 4 : pct > 62 ? 3 : pct > 37 ? 2 : pct > 12 ? 1 : 0], &icons_14, pct > 20 ? C_GREEN : C_RED);
 
-  lv_obj_t* body = col(root, 240, 1, 8);
+  lv_obj_t* body = col(root, 240, 1, 7);
   lv_obj_set_flex_grow(body, 1);
   lv_obj_set_style_pad_hor(body, 10, 0);
-  lv_obj_set_style_pad_top(body, 6, 0);
+  lv_obj_set_style_pad_top(body, 4, 0);
   lv_obj_set_style_pad_bottom(body, 8, 0);
+  lv_obj_add_flag(body, LV_OBJ_FLAG_SCROLLABLE);   // in case PIN + unread card + radio line don't all fit
+  lv_obj_set_scroll_dir(body, LV_DIR_VER);
+  lv_obj_set_scrollbar_mode(body, LV_SCROLLBAR_MODE_OFF);
 
   // clock
   lv_obj_t* clk = col(body, lv_pct(100), LV_SIZE_CONTENT, 2);
@@ -1147,6 +1150,18 @@ void UITask::buildHome() {
     snprintf(date, sizeof(date), "Clock not set \xE2\x80\x94 waiting for phone or mesh");
   }
   label(clk, date, &F12, C_TXT2);
+  // radio parameters: freq · bandwidth · SF · CR · TX power
+  {
+    char bw[12];
+    float b = _node_prefs->bw;
+    if (b == (int)b) snprintf(bw, sizeof(bw), "%d", (int)b); else snprintf(bw, sizeof(bw), "%.1f", b);
+    char rp[64];
+    snprintf(rp, sizeof(rp), I_SIGNAL " %.3f MHz \xC2\xB7 BW%s \xC2\xB7 SF%u \xC2\xB7 CR%u \xC2\xB7 %ddBm",
+             _node_prefs->freq, bw, _node_prefs->sf, _node_prefs->cr, _node_prefs->tx_power_dbm);
+    lv_obj_t* rl = label(clk, rp, &F10, C_TXT2);
+    lv_obj_set_style_text_font(rl, &F10, 0);
+    lv_obj_set_style_pad_top(rl, 2, 0);
+  }
   if (isBluetoothEnabled() && !conn) {
     char pin[40]; snprintf(pin, sizeof(pin), I_BT "  Pair with PIN %06lu", (unsigned long)the_mesh.getBLEPin());
     label(clk, pin, &F12, C_ACCENT);
