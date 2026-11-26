@@ -105,6 +105,10 @@ public:
       virtual void onTraceRecv(mesh::Packet *pkt, uint32_t tag, uint32_t auth_code, uint8_t flags,
                                const uint8_t *path_snrs, const uint8_t *path_hashes, uint8_t path_len) { }
       virtual void onRawDataRecv(mesh::Packet *pkt) { }
+      // MeshSyd on-device UI: results of uiSendLogin() / uiSendStatusReq()
+      virtual void onLoginResult(const ContactInfo &contact, bool ok, uint8_t permissions) { }
+      virtual void onStatusResult(const ContactInfo &contact, const uint8_t *data, uint8_t len) { }
+      virtual void onEchoHeard(uint32_t ui_tag, uint8_t count) { }   // our packet re-sent by a repeater
       virtual ~Listener() { }
   };
 
@@ -145,6 +149,12 @@ protected:
   void sendFloodScoped(const mesh::GroupChannel& channel, mesh::Packet* pkt, uint32_t delay_millis=0) override;
 
   void logRxRaw(float snr, float rssi, const uint8_t raw[], int len) override;
+  void logTx(mesh::Packet* pkt, int len) override;
+  void logRx(mesh::Packet* pkt, int len, float score) override;
+  uint32_t ui_track_tag = 0;
+  uint8_t  ui_track_type = 0;
+  struct UiEcho { uint32_t tag; uint8_t count; uint8_t hash[MAX_HASH_SIZE]; } ui_echo[6] = {};
+  uint8_t  ui_echo_next = 0;
   bool isAutoAddEnabled() const override;
   bool shouldAutoAddContactType(uint8_t type) const override;
   bool shouldOverwriteWhenFull() const override;
@@ -194,6 +204,18 @@ protected:
   }
 
 public:
+  // On-device UI helpers (MeshSyd): same effect as the app's CMD_RESET_PATH / CMD_REMOVE_CONTACT / CMD_SEND_TRACE_PATH
+  bool uiResetPath(const uint8_t* pub_key);
+  bool uiSetPath(const uint8_t* pub_key, const uint8_t* path, uint8_t hops, uint8_t hash_size);
+  bool uiRemoveContact(const uint8_t* pub_key);
+  bool uiSendTrace(const uint8_t* path, uint8_t path_len, uint8_t flags, uint32_t tag, uint32_t& est_timeout);
+  int  uiSendLogin(const uint8_t* pub_key, const char* password, uint32_t& est_timeout);
+  int  uiSendStatusReq(const uint8_t* pub_key, uint32_t& est_timeout);
+  int  uiSendCli(const uint8_t* pub_key, const char* text, uint32_t& est_timeout);
+  // "Heard N repeats": the next transmitted packet of this payload type is tagged, and
+  // every later reception of the same packet hash counts as an echo from a repeater.
+  void uiTrackNextTx(uint32_t ui_tag, uint8_t payload_type) { ui_track_tag = ui_tag; ui_track_type = payload_type; }
+
   void savePrefs() {
     _prefs.node_lat = sensors.node_lat;
     _prefs.node_lon = sensors.node_lon;

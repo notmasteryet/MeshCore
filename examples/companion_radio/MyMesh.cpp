@@ -720,6 +720,7 @@ void MyMesh::onContactResponse(const ContactInfo &contact, const uint8_t *data, 
       memcpy(&out_frame[i], contact.id.pub_key, 6);
       i += 6; // pub_key_prefix
     }
+    if (_listener) _listener->onLoginResult(contact, out_frame[0] == PUSH_CODE_LOGIN_SUCCESS, out_frame[1]);
     _serial->writeFrame(out_frame, i);
   } else if (len > 4 && // check for status response
              pending_status &&
@@ -735,6 +736,7 @@ void MyMesh::onContactResponse(const ContactInfo &contact, const uint8_t *data, 
     i += 6; // pub_key_prefix
     memcpy(&out_frame[i], &data[4], len - 4);
     i += (len - 4);
+    if (_listener) _listener->onStatusResult(contact, &data[4], len - 4);
     _serial->writeFrame(out_frame, i);
   } else if (len > 4 && tag == pending_telemetry) {  // check for matching response tag
     pending_telemetry = 0;
@@ -2451,4 +2453,89 @@ bool MyMesh::advert() {
 // To check if there is pending work
 bool MyMesh::hasPendingWork() const {
   return _mgr->getOutboundTotal() > 0 || dirty_contacts_expiry != 0;
+}
+
+// ---- On-device UI helpers (MeshSyd) ----
+bool MyMesh::uiResetPath(const uint8_t* pub_key) {
+  ContactInfo* c = lookupContactByPubKey(pub_key, PUB_KEY_SIZE);
+  if (!c) return false;
+  c->out_path_len = OUT_PATH_UNKNOWN;
+  dirty_contacts_expiry = futureMillis(LAZY_CONTACTS_WRITE_DELAY);
+  return true;
+}
+
+bool MyMesh::uiRemoveContact(const uint8_t* pub_key) {
+  ContactInfo* c = lookupContactByPubKey(pub_key, PUB_KEY_SIZE);
+  if (!c || !removeContact(*c)) return false;
+  _store->deleteBlobByKey(pub_key, PUB_KEY_SIZE);
+  dirty_contacts_expiry = futureMillis(LAZY_CONTACTS_WRITE_DELAY);
+  return true;
+}
+
+bool MyMesh::uiSendTrace(const uint8_t* path, uint8_t path_len, uint8_t flags, uint32_t tag, uint32_t& est_timeout) {
+  uint8_t path_sz = flags & 0x03;
+  if (path_len == 0 || (path_len >> path_sz) > MAX_PATH_SIZE) return false;
+  auto pkt = createTrace(tag, 0, flags);
+  if (!pkt) return false;
+  sendDirect(pkt, path, path_len);
+  uint32_t t = _radio->getEstAirtimeFor(pkt->payload_len + pkt->path_len + 2);
+  est_timeout = calcDirectTimeoutMillisFor(t, path_len >> path_sz);
+  return true;
+}
+
+int MyMesh::uiSendLogin(const uint8_t* pub_key, const char* password, uint32_t& est_timeout) {
+  ContactInfo* c = lookupContactByPubKey(pub_key, PUB_KEY_SIZE);
+  if (!c) return MSG_SEND_FAILED;
+  int r = sendLogin(*c, password, est_timeout);
+  if (r != MSG_SEND_FAILED) { clearPendingReqs(); memcpy(&pending_login, c->id.pub_key, 4); }
+  return r;
+}
+
+int MyMesh::uiSendStatusReq(const uint8_t* pub_key, uint32_t& est_timeout) {
+  ContactInfo* c = lookupContactByPubKey(pub_key, PUB_KEY_SIZE);
+  if (!c) return MSG_SEND_FAILED;
+  uint32_t tag;
+  int r = sendRequest(*c, REQ_TYPE_GET_STATUS, tag, est_timeout);
+  if (r != MSG_SEND_FAILED) { clearPendingReqs(); memcpy(&pending_status, c->id.pub_key, 4); }
+  return r;
+}
+
+int MyMesh::uiSendCli(const uint8_t* pub_key, const char* text, uint32_t& est_timeout) {
+  ContactInfo* c = lookupContactByPubKey(pub_key, PUB_KEY_SIZE);
+  if (!c) return MSG_SEND_FAILED;
+  uint32_t ts = getRTCClock()->getCurrentTimeUnique();   // node clock, like the app path, to avoid replay rejection
+  return sendCommandData(*c, ts, 0, TXT_TYPE_CLI_DATA, text, est_timeout);
+}
+
+void MyMesh::logTx(mesh::Packet* pkt, int len) {
+  if (ui_track_tag && pkt->getPayloadType() == ui_track_type) {
+    UiEcho& e = ui_echo[ui_echo_next];
+    ui_echo_next = (ui_echo_next + 1) % 6;
+    e.tag = ui_track_tag; e.count = 0;
+    pkt->calculatePacketHash(e.hash);
+    ui_track_tag = 0;
+  }
+}
+
+void MyMesh::logRx(mesh::Packet* pkt, int len, float score) {
+  uint8_t h[MAX_HASH_SIZE];
+  bool hashed = false;
+  for (auto& e : ui_echo) {
+    if (!e.tag) continue;
+    if (!hashed) { pkt->calculatePacketHash(h); hashed = true; }
+    if (memcmp(h, e.hash, MAX_HASH_SIZE) == 0) {
+      if (e.count < 255) e.count++;
+      if (_listener) _listener->onEchoHeard(e.tag, e.count);
+      break;
+    }
+  }
+}
+
+bool MyMesh::uiSetPath(const uint8_t* pub_key, const uint8_t* path, uint8_t hops, uint8_t hash_size) {
+  ContactInfo* c = lookupContactByPubKey(pub_key, PUB_KEY_SIZE);
+  if (!c || hash_size < 1 || hash_size > 4 || hops > 63 || hops * hash_size > MAX_PATH_SIZE) return false;
+  memcpy(c->out_path, path, hops * hash_size);
+  c->out_path_len = ((hash_size - 1) << 6) | hops;
+  dirty_contacts_expiry = futureMillis(LAZY_CONTACTS_WRITE_DELAY);
+  return true;
 }
