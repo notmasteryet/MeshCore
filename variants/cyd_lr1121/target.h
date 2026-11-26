@@ -5,6 +5,7 @@
 #include <helpers/radiolib/RadioLibWrappers.h>
 #include <helpers/radiolib/CustomLR1121Wrapper.h>
 #include <helpers/ArduinoHelpers.h>
+#include <helpers/AutoDiscoverRTCClock.h>
 #include <helpers/SensorManager.h>
 #include "CYDBoard.h"
 #ifdef DISPLAY_CLASS
@@ -14,7 +15,7 @@
 
 extern CYDBoard board;
 extern WRAPPER_CLASS radio_driver;
-extern ESP32RTCClock rtc_clock;
+extern AutoDiscoverRTCClock rtc_clock;   // uses an I2C RTC (DS3231, PCF8563, RV3028...) if fitted
 extern SensorManager sensors;
 
 #ifdef DISPLAY_CLASS

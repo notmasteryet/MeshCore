@@ -206,6 +206,10 @@ protected:
 public:
   // On-device UI helpers (MeshSyd): same effect as the app's CMD_RESET_PATH / CMD_REMOVE_CONTACT / CMD_SEND_TRACE_PATH
   bool uiResetPath(const uint8_t* pub_key);
+  int  uiAddChannel(const char* name, const uint8_t* secret16);   // returns slot or -1 (-2 = key already used)
+  bool uiRemoveChannel(int idx);
+  int  uiAddContact(const char* name, const uint8_t* pub_key, uint8_t type);   // 1 ok, 0 table full, -1 exists
+  bool uiAdvert(bool flood);   // flood uses the default scope, like the app
   bool uiSetPath(const uint8_t* pub_key, const uint8_t* path, uint8_t hops, uint8_t hash_size);
   bool uiRemoveContact(const uint8_t* pub_key);
   bool uiSendTrace(const uint8_t* path, uint8_t path_len, uint8_t flags, uint32_t tag, uint32_t& est_timeout);

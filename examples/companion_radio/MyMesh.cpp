@@ -2539,3 +2539,57 @@ bool MyMesh::uiSetPath(const uint8_t* pub_key, const uint8_t* path, uint8_t hops
   dirty_contacts_expiry = futureMillis(LAZY_CONTACTS_WRITE_DELAY);
   return true;
 }
+
+int MyMesh::uiAddChannel(const char* name, const uint8_t* secret16) {
+  int free_idx = -1;
+  for (int i = 0; i < MAX_GROUP_CHANNELS; i++) {
+    ChannelDetails ch;
+    if (!getChannel(i, ch)) continue;
+    if (ch.name[0] && memcmp(ch.channel.secret, secret16, 16) == 0) return -2;
+    if (!ch.name[0] && free_idx < 0) free_idx = i;
+  }
+  if (free_idx < 0) return -1;
+  ChannelDetails ch;
+  memset(&ch, 0, sizeof(ch));
+  StrHelper::strncpy(ch.name, name, sizeof(ch.name));
+  memcpy(ch.channel.secret, secret16, 16);   // 128-bit, as CMD_SET_CHANNEL
+  if (!setChannel(free_idx, ch)) return -1;
+  saveChannels();
+  return free_idx;
+}
+
+bool MyMesh::uiRemoveChannel(int idx) {
+  ChannelDetails ch;
+  memset(&ch, 0, sizeof(ch));
+  if (!setChannel(idx, ch)) return false;
+  saveChannels();
+  return true;
+}
+
+int MyMesh::uiAddContact(const char* name, const uint8_t* pub_key, uint8_t type) {
+  if (lookupContactByPubKey(pub_key, PUB_KEY_SIZE)) return -1;
+  ContactInfo c;
+  memset(&c, 0, sizeof(c));
+  c.id = mesh::Identity(pub_key);
+  StrHelper::strncpy(c.name, name, sizeof(c.name));
+  c.type = type;
+  c.out_path_len = OUT_PATH_UNKNOWN;
+  c.lastmod = getRTCClock()->getCurrentTime();
+  if (!addContact(c)) return 0;
+  dirty_contacts_expiry = futureMillis(LAZY_CONTACTS_WRITE_DELAY);
+  return 1;
+}
+
+bool MyMesh::uiAdvert(bool flood) {
+  mesh::Packet* pkt = (_prefs.advert_loc_policy == ADVERT_LOC_NONE) ? createSelfAdvert(_prefs.node_name)
+                                                                    : createSelfAdvert(_prefs.node_name, sensors.node_lat, sensors.node_lon);
+  if (!pkt) return false;
+  if (flood) {
+    TransportKey default_scope;
+    memcpy(&default_scope.key, _prefs.default_scope_key, sizeof(default_scope.key));
+    sendFloodScoped(default_scope, pkt, 0);
+  } else {
+    sendZeroHop(pkt);
+  }
+  return true;
+}

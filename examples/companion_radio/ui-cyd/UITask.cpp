@@ -6,6 +6,9 @@
 #include <time.h>
 #include <helpers/AdvertDataHelpers.h>
 #include <helpers/TxtDataHelpers.h>
+// base64.hpp is header-only (non-inline); BaseChatMesh.cpp already compiles it, so just declare what we use
+unsigned int decode_base64(const unsigned char input[], unsigned char output[]);
+unsigned int decode_base64_length(const unsigned char input[]);
 
 #define MESHSYD_VERSION "0.1"
 
@@ -78,8 +81,12 @@ static UITask* g_ui = nullptr;
 static lv_obj_t* g_toast = nullptr;
 static lv_obj_t* g_ta = nullptr;       // compose / edit textarea
 static lv_obj_t* g_count = nullptr;    // compose char counter
+static lv_obj_t* g_modal = nullptr;
+static void close_modal() { if (g_modal) { lv_obj_del(g_modal); g_modal = nullptr; } }
+static void share_me_modal();
 static bool g_shift = false, g_nums = false, g_syms = false;
 
+void close_modal_ext();
 static void input_screen(const char* title, const char* initial, int max_len, bool password, int mode,
                          CydScreen back, const char* hint);
 
@@ -752,6 +759,136 @@ void UITask::pathEditSave(bool flood) {
   show(CydScreen::ContactDetail);
 }
 
+// hex string (spaces / - / : ignored) -> exactly n bytes
+static bool parse_hex(const char* text, uint8_t* out, int n) {
+  int k = 0, nib = -1;
+  for (const char* p = text; *p; p++) {
+    if (*p == ' ' || *p == '-' || *p == ':') continue;
+    if (!isxdigit((uint8_t)*p)) return false;
+    int v = isdigit((uint8_t)*p) ? *p - '0' : (tolower(*p) - 'a' + 10);
+    if (nib < 0) nib = v; else { if (k >= n) return false; out[k++] = (nib << 4) | v; nib = -1; }
+  }
+  return k == n && nib < 0;
+}
+
+// ---- contacts: add by key, share me ----
+void UITask::contactNameEntered(const char* name) {
+  strncpy(_new_ct_name, name, sizeof(_new_ct_name) - 1);
+  _new_ct_name[sizeof(_new_ct_name) - 1] = 0;
+  show(CydScreen::ContactKey);
+}
+
+void UITask::contactKeyEntered(const char* key) {
+  if (!parse_hex(key, _new_ct_key, 32)) { toast("Public key must be 64 hex digits"); show(CydScreen::ContactKey); return; }
+  show(CydScreen::ContactType);
+}
+
+void UITask::contactTypeChosen(uint8_t type) {
+  int r = the_mesh.uiAddContact(_new_ct_name, _new_ct_key, type);
+  toast(r == 1 ? "Contact added" : r == -1 ? "Already in contacts" : "Contacts full");
+  show(CydScreen::Contacts);
+}
+
+void UITask::shareMe(bool flood) {
+  close_modal_ext();
+  toast(the_mesh.uiAdvert(flood) ? (flood ? "Advert sent to the whole mesh" : "Advert sent to nearby nodes") : "Advert failed");
+}
+
+// ---- channel invites over (encrypted) DMs ----
+#define INVITE_PREFIX "Join channel \""
+void UITask::shareChannelTo(int contact_idx) {
+  ChannelDetails cd; ContactInfo ci;
+  if (!the_mesh.getChannel(_info_chan, cd) || !the_mesh.getContactByIdx(contact_idx, ci)) return;
+  char text[96]; int n = snprintf(text, sizeof(text), INVITE_PREFIX "%s\" key ", cd.name);
+  for (int i = 0; i < 16; i++) n += snprintf(text + n, sizeof(text) - n, "%02x", cd.channel.secret[i]);
+  int k = findOrAddContactConv(ci);
+  int prev = _open_conv;
+  _open_conv = k;
+  sendCompose(text);   // DM: end-to-end encrypted to this contact; shows in that chat
+  (void)prev;
+  toast("Invite sent");
+}
+
+void UITask::joinChannelFromText(const char* text) {
+  const char* q = text + strlen(INVITE_PREFIX);
+  const char* e = strchr(q, '"');
+  const char* kp = e ? strstr(e, "key ") : nullptr;
+  uint8_t secret[16];
+  if (!e || !kp || e - q > 31 || !parse_hex(kp + 4, secret, 16)) { toast("Invite not readable"); return; }
+  char name[32]; memcpy(name, q, e - q); name[e - q] = 0;
+  int idx = the_mesh.uiAddChannel(name, secret);
+  if (idx == -2) { toast("Already joined"); return; }
+  if (idx < 0) { toast("No free channel slots (16)"); return; }
+  findOrAddChannelConv(idx, name);
+  historyChanged();
+  char t[48]; snprintf(t, sizeof(t), "Joined %s", name);
+  toast(t);
+  _dirty = true;
+}
+
+// ---- channels ----
+void UITask::channelNameEntered(const char* name) {
+  strncpy(_new_ch_name, name, sizeof(_new_ch_name) - 1);
+  _new_ch_name[sizeof(_new_ch_name) - 1] = 0;
+  show(CydScreen::ChannelKey);
+}
+
+// key: 32 hex digits (spaces allowed) or base64 of 16 bytes; empty = new random key
+void UITask::channelKeyEntered(const char* key) {
+  uint8_t secret[16];
+  char clean[64]; int n = 0;
+  for (const char* p = key; *p && n < (int)sizeof(clean) - 1; p++) if (*p != ' ' && *p != '-' && *p != ':') clean[n++] = *p;
+  clean[n] = 0;
+  bool generated = false;
+  if (n == 0) { esp_fill_random(secret, 16); generated = true; }
+  else {
+    bool hex = n == 32;
+    for (int i = 0; hex && i < n; i++) hex = isxdigit((uint8_t)clean[i]);
+    if (hex) {
+      for (int i = 0; i < 16; i++) { char b[3] = { clean[i * 2], clean[i * 2 + 1], 0 }; secret[i] = strtoul(b, nullptr, 16); }
+    } else {
+      uint8_t tmp[48];
+      if (decode_base64_length((unsigned char*)clean) != 16) {
+        toast("Key must be 32 hex digits");
+        show(CydScreen::ChannelKey);
+        return;
+      }
+      decode_base64((unsigned char*)clean, tmp);
+      memcpy(secret, tmp, 16);
+    }
+  }
+  int idx = the_mesh.uiAddChannel(_new_ch_name, secret);
+  if (idx == -2) { toast("You already have a channel with this key"); show(CydScreen::Chats); return; }
+  if (idx < 0) { toast("No free channel slots (16)"); show(CydScreen::Chats); return; }
+  findOrAddChannelConv(idx, _new_ch_name);
+  historyChanged();
+  toast(generated ? "Channel created \xE2\x80\x94 share its key" : "Channel added");
+  _info_chan = idx;
+  _leave_armed = false;
+  show(generated ? CydScreen::ChannelInfo : CydScreen::Chats);
+}
+
+void UITask::openChannelInfo() {
+  if (_open_conv < 0 || !_convs[_open_conv].is_channel) return;
+  _info_chan = _convs[_open_conv].chan_idx;
+  _leave_armed = false;
+  show(CydScreen::ChannelInfo);
+}
+
+void UITask::leaveChannel() {
+  if (!_leave_armed) { _leave_armed = true; show(CydScreen::ChannelInfo); return; }
+  if (!the_mesh.uiRemoveChannel(_info_chan)) { toast("Could not remove channel"); return; }
+  for (int i = 0; i < CYD_MAX_CONVS; i++)
+    if (_convs[i].used && _convs[i].is_channel && _convs[i].chan_idx == _info_chan) {
+      _convs[i].used = 0;
+      for (int m = 0; m < CYD_MAX_MSGS; m++) if (_msgs[m].conv == i) _msgs[m].conv = 0xFF;   // orphan its messages
+      if (_open_conv == i) _open_conv = -1;
+    }
+  historyChanged();
+  toast("Left channel");
+  show(CydScreen::Chats);
+}
+
 // ---- remote admin ----
 void UITask::loadPasswords() {
   memset(_pws, 0, sizeof(_pws));
@@ -1112,6 +1249,7 @@ void UITask::buildChats() {
   char hm[8]; fmt_hm(clock_valid() ? now_epoch() : 0, hm, sizeof(hm));
   lv_obj_t* tl = label(tb, hm, &F10, C_TXT2);
   lv_obj_set_style_text_font(tl, &inter_10, 0);
+  icon_btn(tb, I_PLUS, 30, 26, C_CARD2, C_ACCENT, nav_cb, (void*)(intptr_t)CydScreen::ChannelName);
 
   lv_obj_t* list = col(root, 240, 1, 2);
   lv_obj_set_flex_grow(list, 1);
@@ -1180,11 +1318,15 @@ void UITask::buildConversation() {
   avatar(hd, 24, c.name, false, c.is_channel);
   lv_obj_t* tc = col(hd, 1, LV_SIZE_CONTENT);
   lv_obj_set_flex_grow(tc, 1);
+  if (c.is_channel) {
+    lv_obj_add_flag(tc, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(tc, [](lv_event_t* e) { g_ui->openChannelInfo(); }, LV_EVENT_CLICKED, nullptr);
+  }
   lv_obj_t* nm = label(tc, c.name, &F12B, C_TXT);
   lv_label_set_long_mode(nm, LV_LABEL_LONG_DOT);
   lv_obj_set_width(nm, lv_pct(100));
   char sub[40];
-  if (c.is_channel) snprintf(sub, sizeof(sub), "channel");
+  if (c.is_channel) snprintf(sub, sizeof(sub), "channel \xC2\xB7 tap for key");
   else {
     ContactInfo* ci = the_mesh.lookupContactByPubKey(c.pub_prefix, 6);
     if (ci) route_text(*ci, sub, sizeof(sub));
@@ -1240,6 +1382,19 @@ void UITask::buildConversation() {
       else snprintf(st, sizeof(st), "sending\xE2\x80\xA6");
       snprintf(meta, sizeof(meta), "%s \xC2\xB7 %s", hm, st);
     } else snprintf(meta, sizeof(meta), "%s", hm);
+    if (!m.out && !c.is_channel && strncmp(m.text, INVITE_PREFIX, strlen(INVITE_PREFIX)) == 0) {
+      lv_obj_t* jb = row(b, 28, 6);
+      lv_obj_set_width(jb, LV_SIZE_CONTENT);
+      lv_obj_set_style_bg_color(jb, lv_color_hex(C_ACCENT), 0);
+      lv_obj_set_style_bg_opa(jb, LV_OPA_COVER, 0);
+      lv_obj_set_style_radius(jb, 8, 0);
+      lv_obj_set_style_pad_hor(jb, 12, 0);
+      pressable(jb, 0x8AD8FF);
+      lv_obj_add_event_cb(jb, [](lv_event_t* e) { g_ui->joinChannelFromText((const char*)lv_event_get_user_data(e)); },
+                          LV_EVENT_CLICKED, (void*)m.text);
+      label(jb, I_PLUS, &icons_14, C_ACC_INK);
+      label(jb, "Join channel", &F12B, C_ACC_INK);
+    }
     lv_obj_t* ml = label(b, meta, &F10, m.out ? (m.status == 3 ? C_RED : C_OUT_META) : C_TXT3);
     lv_obj_set_style_text_font(ml, &inter_10, 0);
     if (m.out) lv_obj_set_style_text_align(ml, LV_TEXT_ALIGN_RIGHT, 0);
@@ -1302,7 +1457,18 @@ static const char* KB_SYMS[]  = { "[","]","{","}","#","^","_","\\","|","~","\n",
                                   "123","-","/",":",";","@","&","\"",I_BKSP,"\n",
                                   "abc",",","space",".",I_ENTER,"" };
 
+static const char* KB_HEX[] = { "1","2","3","4","5","6","\n",
+                                "7","8","9","0","a","b","\n",
+                                "c","d","e","f","space",I_BKSP,"\n",
+                                I_ENTER,"" };
+static bool g_hex = false;
+
 static void kb_apply_widths(lv_obj_t* kb) {
+  if (g_hex) {
+    lv_btnmatrix_set_btn_width(kb, 16, 2);   // space
+    lv_btnmatrix_set_btn_width(kb, 17, 2);   // backspace
+    return;
+  }
   // rows 1-2: equal; row 3: shift/backspace wider; row 4: space wide
   lv_btnmatrix_set_btn_width(kb, 19, 3);   // shift / '#'
   lv_btnmatrix_set_btn_width(kb, 27, 3);   // backspace
@@ -1314,7 +1480,7 @@ static void kb_apply_widths(lv_obj_t* kb) {
 }
 
 static void kb_set_map(lv_obj_t* kb) {
-  lv_btnmatrix_set_map(kb, g_syms ? KB_SYMS : g_nums ? KB_NUMS : (g_shift ? KB_UPPER : KB_LOWER));
+  lv_btnmatrix_set_map(kb, g_hex ? KB_HEX : g_syms ? KB_SYMS : g_nums ? KB_NUMS : (g_shift ? KB_UPPER : KB_LOWER));
   kb_apply_widths(kb);
 }
 
@@ -1333,7 +1499,7 @@ static void submit_text() {
   int mode = (int)(intptr_t)lv_obj_get_user_data(lv_scr_act());
   int n = strlen(buf);
   while (n && buf[n - 1] == ' ') buf[--n] = 0;
-  if (!n && mode != 3 && mode != 5) return;   // empty password (guest) / empty route (direct) are allowed
+  if (!n && mode != 3 && mode != 5 && mode != 7) return;   // empty key = generate one   // empty password (guest) / empty route (direct) are allowed
   g_ta = nullptr; g_count = nullptr;
   switch (mode) {
     case 1: g_ui->sendCompose(buf); break;
@@ -1341,6 +1507,10 @@ static void submit_text() {
     case 3: g_ui->submitLogin(buf); break;
     case 4: g_ui->sendCli(buf); break;
     case 5: g_ui->pathEditTyped(buf); break;
+    case 6: g_ui->channelNameEntered(buf); break;
+    case 7: g_ui->channelKeyEntered(buf); break;
+    case 8: g_ui->contactNameEntered(buf); break;
+    case 9: g_ui->contactKeyEntered(buf); break;
   }
 }
 
@@ -1362,7 +1532,7 @@ static void kb_cb(lv_event_t* e) {
   update_count();
 }
 
-static lv_obj_t* make_keyboard(lv_obj_t* root) {
+static lv_obj_t* make_keyboard(lv_obj_t* root, bool hex = false) {
   lv_obj_t* kb = lv_btnmatrix_create(root);
   lv_obj_set_size(kb, 240, 176);
   lv_obj_set_style_bg_color(kb, lv_color_hex(C_CARD), 0);
@@ -1382,7 +1552,8 @@ static lv_obj_t* make_keyboard(lv_obj_t* root) {
   lv_obj_set_style_text_font(kb, &F14, LV_PART_ITEMS);
   lv_obj_set_style_outline_width(kb, 0, LV_PART_ITEMS | LV_STATE_FOCUS_KEY);
   lv_obj_set_style_outline_width(kb, 0, LV_PART_ITEMS | LV_STATE_FOCUSED);
-  g_shift = false; g_nums = false; g_syms = false;
+  g_shift = false; g_nums = false; g_syms = false; g_hex = hex;
+  if (hex) lv_obj_set_style_text_font(kb, &F16B, LV_PART_ITEMS);
   kb_set_map(kb);
   lv_obj_add_event_cb(kb, kb_cb, LV_EVENT_VALUE_CHANGED, nullptr);
   return kb;
@@ -1477,7 +1648,7 @@ static void input_screen(const char* title, const char* initial, int max_len, bo
     lv_label_set_long_mode(h, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(h, lv_pct(100));
   }
-  make_keyboard(root);
+  make_keyboard(root, mode == 5 || mode == 7 || mode == 9);   // hex keypad for route IDs and channel keys
 }
 
 void UITask::buildEditName() {
@@ -1505,6 +1676,8 @@ void UITask::buildContacts() {
   char kn[24]; snprintf(kn, sizeof(kn), "%d known", total);
   lv_obj_t* kl = label(tb, kn, &F10, C_TXT2);
   lv_obj_set_style_text_font(kl, &inter_10, 0);
+  icon_btn(tb, I_TOWER, 30, 26, C_CARD2, C_ACCENT, [](lv_event_t* e) { share_me_modal(); }, nullptr);
+  icon_btn(tb, I_PLUS, 30, 26, C_CARD2, C_ACCENT, nav_cb, (void*)(intptr_t)CydScreen::ContactName);
 
   // segmented filter
   lv_obj_t* segw = row(root, 32, 0);
@@ -1949,8 +2122,153 @@ void UITask::buildPathEdit() {
   lv_obj_set_width(b1, 70); lv_obj_set_width(b2, 64); lv_obj_set_width(b3, 80);
 }
 
+void UITask::buildChannelName() {
+  input_screen("New channel: name", "", 31, false, 6, CydScreen::Chats, "A name for this channel on your device, e.g. Family.");
+}
+
+void UITask::buildChannelKey() {
+  char t[48]; snprintf(t, sizeof(t), "Key for %s", _new_ch_name);
+  input_screen(t, "", 60, false, 7, CydScreen::ChannelName,
+               "Shared key: 32 hex digits (spaces OK). Leave empty to create a new private channel with a random key.");
+}
+
+void UITask::buildChannelInfo() {
+  ChannelDetails cd;
+  if (_info_chan < 0 || !the_mesh.getChannel(_info_chan, cd) || !cd.name[0]) { show(CydScreen::Chats); return; }
+  lv_obj_t* root = screen_root();
+  sub_header(root, cd.name, _open_conv >= 0 ? CydScreen::Conversation : CydScreen::Chats);
+  lv_obj_t* body = col(root, 240, 1, 8);
+  lv_obj_set_flex_grow(body, 1);
+  lv_obj_set_style_pad_hor(body, 10, 0);
+  lv_obj_add_flag(body, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_scroll_dir(body, LV_DIR_VER);
+
+  lv_obj_t* k = label(body, "Channel key (hex). Share it to let others join:", &F10, C_TXT2);
+  lv_obj_set_style_text_font(k, &inter_10, 0);
+  lv_obj_t* card = col(body, lv_pct(100), LV_SIZE_CONTENT, 2);
+  lv_obj_set_style_bg_color(card, lv_color_hex(C_CARD), 0);
+  lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+  lv_obj_set_style_radius(card, 10, 0);
+  lv_obj_set_style_pad_all(card, 10, 0);
+  for (int line = 0; line < 2; line++) {
+    char hx[40]; int n = 0;
+    for (int i = 0; i < 8; i++) {
+      n += snprintf(hx + n, sizeof(hx) - n, "%02x", cd.channel.secret[line * 8 + i]);
+      if (i == 3) hx[n++] = ' ';
+    }
+    hx[n] = 0;
+    label(card, hx, &F16B, C_TXT);
+  }
+
+  lv_obj_t* r0 = row(body, 40, 0);
+  lv_obj_set_flex_align(r0, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  action_btn(r0, I_SEND, "Share via DM", C_ACCENT, C_ACC_INK, nav_cb);
+  lv_obj_remove_event_cb(lv_obj_get_child(r0, 0), nav_cb);
+  lv_obj_add_event_cb(lv_obj_get_child(r0, 0), nav_cb, LV_EVENT_CLICKED, (void*)(intptr_t)CydScreen::SharePick);
+  lv_obj_set_width(lv_obj_get_child(r0, 0), 160);
+  lv_obj_t* r = row(body, 40, 0);
+  lv_obj_set_flex_align(r, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  if (_leave_armed) action_btn(r, I_CLOSE, "Confirm leave", 0x5A1F1F, C_RED, [](lv_event_t* e) { g_ui->leaveChannel(); });
+  else action_btn(r, I_CLOSE, "Leave channel", C_CARD2, C_RED, [](lv_event_t* e) { g_ui->leaveChannel(); });
+  lv_obj_set_width(lv_obj_get_child(r, 0), 160);
+  tab_bar(root, CydScreen::Chats, totalUnread());
+}
+
+void UITask::buildContactType() {
+  lv_obj_t* root = screen_root();
+  char t[48]; snprintf(t, sizeof(t), "%s is a\xE2\x80\xA6", _new_ct_name);
+  sub_header(root, t, CydScreen::ContactKey);
+  lv_obj_t* body = col(root, 240, 1, 10);
+  lv_obj_set_flex_grow(body, 1);
+  lv_obj_set_style_pad_all(body, 14, 0);
+  struct T { const char* icon; const char* name; uint8_t type; } ts[] = {
+    { I_USER, "Person", ADV_TYPE_CHAT }, { I_TOWER, "Repeater", ADV_TYPE_REPEATER }, { I_CHAT, "Room server", ADV_TYPE_ROOM } };
+  for (auto& x : ts) {
+    lv_obj_t* b = row(body, 46, 10);
+    lv_obj_set_style_bg_color(b, lv_color_hex(C_CARD), 0);
+    lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(b, 10, 0);
+    lv_obj_set_style_pad_hor(b, 14, 0);
+    pressable(b, C_CARD2);
+    lv_obj_add_event_cb(b, [](lv_event_t* e) { g_ui->contactTypeChosen((uint8_t)(intptr_t)lv_event_get_user_data(e)); },
+                        LV_EVENT_CLICKED, (void*)(intptr_t)x.type);
+    label(b, x.icon, &icons_18, C_ACCENT);
+    label(b, x.name, &F16B, C_TXT);
+  }
+}
+
+static void share_pick_cb(lv_event_t* e) { g_ui->shareChannelTo((int)(intptr_t)lv_event_get_user_data(e)); }
+
+void UITask::buildSharePick() {
+  ChannelDetails cd;
+  if (!the_mesh.getChannel(_info_chan, cd)) { show(CydScreen::Chats); return; }
+  lv_obj_t* root = screen_root();
+  char t[48]; snprintf(t, sizeof(t), "Share %s with\xE2\x80\xA6", cd.name);
+  sub_header(root, t, CydScreen::ChannelInfo);
+  lv_obj_t* list = col(root, 240, 1, 0);
+  lv_obj_set_flex_grow(list, 1);
+  lv_obj_set_style_pad_hor(list, 6, 0);
+  lv_obj_add_flag(list, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_scroll_dir(list, LV_DIR_VER);
+  style_scrollbar(list);
+  int shown = 0;
+  for (int i = MAX_ANON_CONTACTS; i < the_mesh.getTotalContactSlots() && shown < 30; i++) {
+    ContactInfo ci;
+    if (!the_mesh.getContactByIdx(i, ci) || !ci.name[0] || ci.type != ADV_TYPE_CHAT) continue;
+    shown++;
+    lv_obj_t* r = row(list, 38, 8);
+    lv_obj_set_style_pad_hor(r, 6, 0);
+    lv_obj_set_style_border_side(r, LV_BORDER_SIDE_BOTTOM, 0);
+    lv_obj_set_style_border_width(r, 1, 0);
+    lv_obj_set_style_border_color(r, lv_color_hex(C_DIVIDER), 0);
+    pressable(r, C_CARD);
+    lv_obj_add_event_cb(r, share_pick_cb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
+    avatar(r, 26, ci.name, false, false);
+    lv_obj_t* nm = label(r, ci.name, &F12B, C_TXT);
+    lv_label_set_long_mode(nm, LV_LABEL_LONG_DOT);
+    lv_obj_set_flex_grow(nm, 1);
+    label(r, I_SEND, &icons_14, C_ACCENT);
+  }
+  if (!shown) label(list, "No people in contacts yet", &F12, C_TXT3);
+  lv_obj_t* h = label(root, "Sent as an encrypted direct message. Never post a key in a channel.", &F10, C_TXT2);
+  lv_obj_set_style_text_font(h, &inter_10, 0);
+  lv_label_set_long_mode(h, LV_LABEL_LONG_WRAP);
+  lv_obj_set_width(h, 228);
+  lv_obj_set_style_pad_all(h, 6, 0);
+}
+
+static void share_me_modal() {
+  close_modal();
+  g_modal = box(lv_layer_top(), 240, 320, 0x000000, 0);
+  lv_obj_set_style_bg_opa(g_modal, LV_OPA_70, 0);
+  lv_obj_add_flag(g_modal, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(g_modal, [](lv_event_t* e) { if (lv_event_get_target(e) == g_modal) close_modal(); }, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t* card = col(g_modal, 210, LV_SIZE_CONTENT, 8);
+  lv_obj_center(card);
+  lv_obj_set_style_bg_color(card, lv_color_hex(C_CARD), 0);
+  lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+  lv_obj_set_style_radius(card, 12, 0);
+  lv_obj_set_style_pad_all(card, 12, 0);
+  label(card, "Share my contact", &F16B, C_TXT);
+  lv_obj_t* h = label(card, "Sends your advert so others can add you.", &F10, C_TXT2);
+  lv_obj_set_style_text_font(h, &inter_10, 0);
+  lv_label_set_long_mode(h, LV_LABEL_LONG_WRAP);
+  lv_obj_set_width(h, lv_pct(100));
+  const char* names[] = { "Nearby (zero hop)", "Whole mesh (flood)" };
+  for (int i = 0; i < 2; i++) {
+    lv_obj_t* b = row(card, 38, 6);
+    lv_obj_set_style_bg_color(b, lv_color_hex(i ? C_CARD2 : C_ACCENT), 0);
+    lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(b, 10, 0);
+    lv_obj_set_flex_align(b, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    pressable(b, i ? C_KEY : 0x8AD8FF);
+    lv_obj_add_event_cb(b, [](lv_event_t* e) { g_ui->shareMe((bool)(intptr_t)lv_event_get_user_data(e)); }, LV_EVENT_CLICKED, (void*)(intptr_t)i);
+    label(b, names[i], &F12B, i ? C_TXT : C_ACC_INK);
+  }
+}
+void close_modal_ext() { close_modal(); }
+
 // ---- settings ----
-static lv_obj_t* g_modal = nullptr;
 
 static lv_obj_t* settings_row(lv_obj_t* group, const char* icon, uint32_t icon_bg, const char* text, const char* value,
                               bool last, lv_event_cb_t cb, bool chevron = true) {
@@ -1983,7 +2301,6 @@ static lv_obj_t* group_box(lv_obj_t* p) {
   return g;
 }
 
-static void close_modal() { if (g_modal) { lv_obj_del(g_modal); g_modal = nullptr; } }
 
 static void tz_modal() {
   close_modal();
@@ -2221,6 +2538,13 @@ void UITask::show(CydScreen s) {
     case CydScreen::CliInput:     buildCliInput(); break;
     case CydScreen::PathEdit:     buildPathEdit(); break;
     case CydScreen::PathInput:    buildPathInput(); break;
+    case CydScreen::ChannelName:  buildChannelName(); break;
+    case CydScreen::ChannelKey:   buildChannelKey(); break;
+    case CydScreen::ChannelInfo:  buildChannelInfo(); break;
+    case CydScreen::ContactName:  input_screen("New contact: name", "", 31, false, 8, CydScreen::Contacts, "How this contact will appear on your device."); break;
+    case CydScreen::ContactKey:   input_screen("Public key (64 hex)", "", 80, false, 9, CydScreen::ContactName, "From their app: Settings \xE2\x80\xBA public key. Spaces are fine."); break;
+    case CydScreen::ContactType:  buildContactType(); break;
+    case CydScreen::SharePick:    buildSharePick(); break;
   }
   _dirty = false;
 #ifdef MESH_DEBUG
@@ -2367,7 +2691,9 @@ void UITask::loop() {
   // rebuild on data changes, but never under the user's finger or while typing
   static unsigned long last_build = 0;
   bool typing = _screen == CydScreen::Compose || _screen == CydScreen::EditName || _screen == CydScreen::Login ||
-                _screen == CydScreen::CliInput || _screen == CydScreen::PathInput || g_modal;
+                _screen == CydScreen::CliInput || _screen == CydScreen::PathInput ||
+                _screen == CydScreen::ChannelName || _screen == CydScreen::ChannelKey ||
+                _screen == CydScreen::ContactName || _screen == CydScreen::ContactKey || g_modal;
   if (_dirty && _screen_on && !typing && now - _last_touch > 600 && now - last_build > 400) {
     last_build = now;
     show(_screen);

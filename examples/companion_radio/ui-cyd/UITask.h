@@ -21,7 +21,7 @@
 #define CYD_MSG_LEN 160
 #define CYD_CONSOLE_LEN 1536
 
-enum class CydScreen : uint8_t { Home, Chats, Conversation, Compose, Contacts, Settings, EditName, ContactDetail, Login, Status, Console, CliInput, PathEdit, PathInput };
+enum class CydScreen : uint8_t { Home, Chats, Conversation, Compose, Contacts, Settings, EditName, ContactDetail, Login, Status, Console, CliInput, PathEdit, PathInput, ChannelName, ChannelKey, ChannelInfo, ContactName, ContactKey, ContactType, SharePick };
 
 struct CydMsg {
   uint32_t ts;           // epoch (our clock)
@@ -84,6 +84,13 @@ class UITask : public AbstractUITask {
   // route editor
   uint8_t   _pe_path[8][4];   // hop hashes (up to 4 bytes each)
   uint8_t   _pe_n = 0, _pe_hsz = 1;
+  // channels
+  char      _new_ch_name[32] = "";
+  int       _info_chan = -1;
+  bool      _leave_armed = false;
+  // add contact
+  char      _new_ct_name[32] = "";
+  uint8_t   _new_ct_key[32];
 
   // remote admin (repeaters / room servers)
   uint8_t   _admin_pub[32];           // full key of the node we're logged in to (this session)
@@ -180,6 +187,16 @@ public:
   void pathEditRemove(int hop);
   void pathEditSave(bool flood);
   void pathEditTyped(const char* text);
+  void channelNameEntered(const char* name);
+  void channelKeyEntered(const char* key);
+  void openChannelInfo();
+  void leaveChannel();
+  void contactNameEntered(const char* name);
+  void contactKeyEntered(const char* key);
+  void contactTypeChosen(uint8_t type);
+  void shareMe(bool flood);
+  void shareChannelTo(int contact_idx);
+  void joinChannelFromText(const char* text);
   void adminOpen(CydScreen target);
   void submitLogin(const char* password);
   void requestStatus();
@@ -206,5 +223,10 @@ public:
   void buildCliInput();
   void buildPathEdit();
   void buildPathInput();
+  void buildChannelName();
+  void buildChannelKey();
+  void buildChannelInfo();
+  void buildContactType();
+  void buildSharePick();
   const CydConv& conv(int i) const { return _convs[i]; }
 };

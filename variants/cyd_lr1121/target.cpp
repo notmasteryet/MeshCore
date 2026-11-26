@@ -8,7 +8,8 @@ static SPIClass spi(VSPI);
 RADIO_CLASS radio = new Module(P_LORA_NSS, P_LORA_DIO_1, P_LORA_RESET, P_LORA_BUSY, spi);
 WRAPPER_CLASS radio_driver(radio, board);
 
-ESP32RTCClock rtc_clock;
+ESP32RTCClock fallback_clock;
+AutoDiscoverRTCClock rtc_clock(fallback_clock);
 SensorManager sensors;
 
 #ifdef DISPLAY_CLASS
@@ -40,7 +41,8 @@ static const Module::RfSwitchMode_t rfswitch_table[] = {
 };
 
 bool radio_init() {
-  rtc_clock.begin();
+  fallback_clock.begin();
+  rtc_clock.begin(Wire);   // I2C on GPIO21/22 (started in ESP32Board::begin)
 
   spi.begin(P_LORA_SCLK, P_LORA_MISO, P_LORA_MOSI);
   int status = radio.begin(LORA_FREQ, LORA_BW, LORA_SF, LORA_CR, RADIOLIB_LR11X0_LORA_SYNC_WORD_PRIVATE,
