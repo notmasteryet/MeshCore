@@ -52,6 +52,7 @@ struct CydPrefs {
   uint8_t  brightness = 160;
   uint8_t  screen_off_idx = 1;   // 15s, 30s, 1m, 5m, never
   int8_t   tz_hours = 0;         // UTC offset
+  uint8_t  msg_led = 1;          // blink the RGB LED for unread messages
 };
 
 class UITask : public AbstractUITask {
@@ -114,6 +115,13 @@ public:
 private:
 
   void loadPrefs();
+  // message LED (red + green only; blue is not used)
+  uint8_t   _led_color = 0;          // bit0 red, bit1 green
+  uint8_t   _led_steps = 0;          // remaining on/off half-steps
+  unsigned long _led_next = 0, _led_remind = 0;
+  void ledSet(uint8_t color);
+  void ledFlash(uint8_t color, uint8_t count);
+  void ledLoop(unsigned long now);
   void loadHistory();
   void saveHistory();
   unsigned long _save_due = 0;
@@ -147,7 +155,7 @@ public:
   void endWakeTouch();
 
   CydPrefs& prefs() { return _prefs; }
-  void prefsChanged() { savePrefs(); applyBrightness(); }
+  void prefsChanged() { savePrefs(); applyBrightness(); if (!_prefs.msg_led) { _led_steps = 0; ledSet(0); } }
   void setNodeName(const char* name);
   void toggleBluetooth();
   int  openConvIdx() const { return _open_conv; }

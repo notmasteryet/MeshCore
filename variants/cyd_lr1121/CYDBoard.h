@@ -24,6 +24,14 @@ public:
 #ifdef MESH_DEBUG
     Serial.printf("CYD: battery %u mV\n", getBattMilliVolts());
 #endif
+#ifdef CYD_LED_TEST
+    // one-time pin identification: each LED pin alone for 1.5 s
+    const uint8_t test[] = { 4, 16, 17 };
+    for (uint8_t p : test) {
+      Serial.printf("CYD: LED test GPIO%u on\n", p);
+      digitalWrite(p, LOW); delay(1500); digitalWrite(p, HIGH); delay(500);
+    }
+#endif
   }
 
   // Battery divider is 1.48M / 1M (x2.48, as in the Meshtastic port); ESP32Board assumes x2.

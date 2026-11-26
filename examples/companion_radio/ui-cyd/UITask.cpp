@@ -372,8 +372,8 @@ void UITask::toast(const char* text) {
 void UITask::loadPrefs() {
   File f = SPIFFS.open("/meshsyd", "r");
   if (f) {
-    CydPrefs p;
-    if (f.read((uint8_t*)&p, sizeof(p)) == sizeof(p) && p.magic == 0xC7) _prefs = p;
+    CydPrefs p;   // fields missing from an older, shorter file keep their defaults
+    if (f.read((uint8_t*)&p, sizeof(p)) >= 4 && p.magic == 0xC7) _prefs = p;
     f.close();
   }
   if (_prefs.brightness < 10) _prefs.brightness = 10;
@@ -442,6 +442,62 @@ void UITask::onTouchActivity() {
 bool UITask::consumeWakeTouch() { return _swallow_touch; }
 void UITask::endWakeTouch() { _swallow_touch = false; }
 
+// ---- message LED: common-anode RGB (active LOW). GPIO4 red, GPIO17 green, GPIO16 blue.
+// Green is far brighter than red, so colours are mixed with PWM (LEDC ch 4/5; the backlight uses ch 7).
+#define LED_RED   1
+#define LED_GREEN 2
+#define LED_AMBER (LED_RED | LED_GREEN)
+#ifndef CYD_LED_AMBER_GREEN
+  #define CYD_LED_AMBER_GREEN 18   // green level (of 255) mixed into amber
+#endif
+#ifndef CYD_LED_GREEN_LEVEL
+  #define CYD_LED_GREEN_LEVEL 120  // green alone is bright; tone it down
+#endif
+static bool g_led_pwm = false;
+
+static void led_pwm_init() {
+  ledcSetup(4, 5000, 8); ledcAttachPin(PIN_LED_R, 4);
+  ledcSetup(5, 5000, 8); ledcAttachPin(PIN_LED_G, 5);
+  ledcWrite(4, 255); ledcWrite(5, 255);   // active LOW: 255 = off
+  pinMode(PIN_LED_B, OUTPUT); digitalWrite(PIN_LED_B, HIGH);
+  g_led_pwm = true;
+}
+
+void UITask::ledSet(uint8_t color) {
+  if (!g_led_pwm) led_pwm_init();
+  uint8_t r = (color & LED_RED) ? 255 : 0;
+  uint8_t g = (color == LED_AMBER) ? CYD_LED_AMBER_GREEN : (color & LED_GREEN) ? CYD_LED_GREEN_LEVEL : 0;
+  ledcWrite(4, 255 - r);
+  ledcWrite(5, 255 - g);
+}
+
+void UITask::ledFlash(uint8_t color, uint8_t count) {
+  if (!_prefs.msg_led) return;
+  _led_color = color;
+  _led_steps = count * 2;
+  _led_next = millis();
+}
+
+void UITask::ledLoop(unsigned long now) {
+  if (_led_steps) {
+    if (now >= _led_next) {
+      bool on = _led_steps % 2 == 0;
+      ledSet(on ? _led_color : 0);
+      _led_next = now + (on ? 70 : 150);
+      _led_steps--;
+    }
+    return;
+  }
+  // reminder while anything is unread: one short blink every 5 s (amber if a direct message is waiting)
+  if (_prefs.msg_led && now - _led_remind > 5000) {
+    _led_remind = now;
+    bool dm = false, any = false;
+    for (int i = 0; i < CYD_MAX_CONVS; i++)
+      if (_convs[i].used && _convs[i].unread) { any = true; if (!_convs[i].is_channel) dm = true; }
+    if (any) ledFlash(dm ? LED_AMBER : LED_GREEN, 1);
+  }
+}
+
 // =====================================================================
 // data
 // =====================================================================
@@ -505,7 +561,11 @@ void UITask::addMsg(int conv, bool out, const char* sender, const char* text, ui
   else if (c.is_channel && sender && sender[0]) snprintf(c.last, sizeof(c.last), "%s: %s", sender, text);
   else strncpy(c.last, text, sizeof(c.last) - 1);
   bool viewing = _screen_on && (_screen == CydScreen::Conversation || _screen == CydScreen::Compose) && _open_conv == conv;
-  if (!out && !viewing) c.unread++;
+  if (!out && !viewing) {
+    c.unread++;
+    ledFlash(c.is_channel ? LED_GREEN : LED_AMBER, 3);
+    _led_remind = millis();
+  }
   _dirty = true;
   historyChanged();
 }
@@ -1970,6 +2030,101 @@ static void tz_modal() {
   }, LV_EVENT_CLICKED, rl);
 }
 
+// Mesh time: median of (their advert clock - our receive time) over nodes heard in the last 2 hours.
+static bool mesh_time_offset(int32_t* out, int* samples) {
+  int32_t off[24]; int n = 0;
+  uint32_t now = now_epoch();
+  for (int i = MAX_ANON_CONTACTS; i < the_mesh.getTotalContactSlots() && n < 24; i++) {
+    ContactInfo ci;
+    if (!the_mesh.getContactByIdx(i, ci) || !ci.name[0]) continue;
+    if (ci.lastmod + 7200 < now || ci.lastmod > now + 60) continue;
+    if (ci.last_advert_timestamp < CLOCK_SEED) continue;
+    off[n++] = (int32_t)(ci.last_advert_timestamp - ci.lastmod);
+  }
+  *samples = n;
+  if (n == 0) return false;
+  for (int i = 1; i < n; i++) { int32_t v = off[i]; int j = i - 1; while (j >= 0 && off[j] > v) { off[j + 1] = off[j]; j--; } off[j + 1] = v; }
+  *out = off[n / 2];
+  return true;
+}
+
+static lv_obj_t* g_time_lbl = nullptr;
+static void time_refresh_label() {
+  if (!g_time_lbl) return;
+  char b[40], hm[8];
+  if (clock_valid()) {
+    time_t t = (time_t)now_epoch() + (time_t)g_ui->prefs().tz_hours * 3600;
+    struct tm tm; gmtime_r(&t, &tm);
+    snprintf(b, sizeof(b), "%02d:%02d:%02d", tm.tm_hour, tm.tm_min, tm.tm_sec);
+  } else { fmt_hm(0, hm, sizeof(hm)); snprintf(b, sizeof(b), "%s", hm); }
+  lv_label_set_text(g_time_lbl, b);
+}
+
+static void time_adjust_cb(lv_event_t* e) {
+  int32_t d = (int32_t)(intptr_t)lv_event_get_user_data(e);
+  rtc_clock.setCurrentTime(now_epoch() + d);
+  time_refresh_label();
+}
+
+static void time_modal() {
+  close_modal();
+  g_modal = box(lv_layer_top(), 240, 320, 0x000000, 0);
+  lv_obj_set_style_bg_opa(g_modal, LV_OPA_70, 0);
+  lv_obj_add_flag(g_modal, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_t* card = col(g_modal, 216, LV_SIZE_CONTENT, 10);
+  lv_obj_center(card);
+  lv_obj_set_style_bg_color(card, lv_color_hex(C_CARD), 0);
+  lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+  lv_obj_set_style_radius(card, 12, 0);
+  lv_obj_set_style_pad_all(card, 12, 0);
+  lv_obj_set_flex_align(card, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  label(card, "Adjust clock", &F16B, C_TXT);
+  g_time_lbl = label(card, "", &inter_17b, C_ACCENT);
+  time_refresh_label();
+  lv_obj_t* r = row(card, 36, 6);
+  lv_obj_set_flex_align(r, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  const char* lbl[] = { "\xE2\x88\x92" "10m", "\xE2\x88\x92" "1m", "+1m", "+10m" };
+  const int32_t d[] = { -600, -60, 60, 600 };
+  for (int i = 0; i < 4; i++) {
+    lv_obj_t* b = box(r, 44, 34, C_CARD2, 8);
+    pressable(b, C_KEY);
+    lv_obj_center(label(b, lbl[i], &F12B, C_TXT));
+    lv_obj_add_event_cb(b, time_adjust_cb, LV_EVENT_CLICKED, (void*)(intptr_t)d[i]);
+  }
+  int32_t off = 0; int n = 0;
+  bool have = mesh_time_offset(&off, &n);
+  lv_obj_t* mb = row(card, 36, 6);
+  lv_obj_set_style_bg_color(mb, lv_color_hex(C_CARD2), 0);
+  lv_obj_set_style_bg_opa(mb, LV_OPA_COVER, 0);
+  lv_obj_set_style_radius(mb, 10, 0);
+  lv_obj_set_flex_align(mb, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  char mt[48];
+  if (have) snprintf(mt, sizeof(mt), "Use mesh time (%+ld s, %d nodes)", (long)off, n);
+  else snprintf(mt, sizeof(mt), "No recent nodes for mesh time");
+  label(mb, mt, &F12, have ? C_TXT : C_TXT3);
+  if (have) {
+    pressable(mb, C_KEY);
+    lv_obj_add_event_cb(mb, [](lv_event_t* e) {
+      int32_t o = 0; int k = 0;
+      if (mesh_time_offset(&o, &k)) rtc_clock.setCurrentTime(now_epoch() + o);
+      time_refresh_label();
+      g_ui->toast("Clock set to mesh time");
+    }, LV_EVENT_CLICKED, nullptr);
+  }
+  lv_obj_t* hint = label(card, "The phone app can only move the clock forward. Use this if it runs ahead.", &F10, C_TXT2);
+  lv_obj_set_style_text_font(hint, &inter_10, 0);
+  lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
+  lv_obj_set_width(hint, lv_pct(100));
+  lv_obj_t* ok = row(card, 36, 0);
+  lv_obj_set_style_bg_color(ok, lv_color_hex(C_ACCENT), 0);
+  lv_obj_set_style_bg_opa(ok, LV_OPA_COVER, 0);
+  lv_obj_set_style_radius(ok, 10, 0);
+  lv_obj_set_flex_align(ok, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  pressable(ok, 0x8AD8FF);
+  label(ok, "Done", &F12B, C_ACC_INK);
+  lv_obj_add_event_cb(ok, [](lv_event_t* e) { g_time_lbl = nullptr; close_modal(); g_ui->show(CydScreen::Settings); }, LV_EVENT_CLICKED, nullptr);
+}
+
 void UITask::buildSettings() {
   close_modal();
   lv_obj_t* root = screen_root();
@@ -2026,7 +2181,14 @@ void UITask::buildSettings() {
     g_ui->show(CydScreen::Settings);
   }, false);
   char tz[12]; snprintf(tz, sizeof(tz), _prefs.tz_hours == 0 ? "UTC" : "UTC%+d", _prefs.tz_hours);
-  settings_row(g3, I_CLOCK, C_ACCENT, "Time zone", tz, true, [](lv_event_t* e) { tz_modal(); });
+  char clk[12]; fmt_hm(clock_valid() ? now_epoch() : 0, clk, sizeof(clk));
+  settings_row(g3, I_CLOCK, C_GREEN, "Clock", clk, false, [](lv_event_t* e) { time_modal(); });
+  settings_row(g3, I_CLOCK, C_ACCENT, "Time zone", tz, false, [](lv_event_t* e) { tz_modal(); });
+  settings_row(g3, I_BELL, C_RED, "Message LED", _prefs.msg_led ? "On" : "Off", true, [](lv_event_t* e) {
+    g_ui->prefs().msg_led = !g_ui->prefs().msg_led;
+    g_ui->prefsChanged();
+    g_ui->show(CydScreen::Settings);
+  }, false);
 
   lv_obj_t* g4 = group_box(body);
   char about[48];
@@ -2127,6 +2289,8 @@ void UITask::loop() {
   lv_timer_handler();
   unsigned long now = millis();
 
+  ledLoop(now);
+
   // BOOT button: click = screen on/off, hold = wake and go Home
   int ev = user_btn.check();
   if (ev == BUTTON_EVENT_CLICK) {
@@ -2144,6 +2308,8 @@ void UITask::loop() {
 
   if (g_toast && now > _toast_until) { lv_obj_del(g_toast); g_toast = nullptr; }
   if (_save_due && now > _save_due) saveHistory();
+  static unsigned long tl = 0;
+  if (g_time_lbl && now - tl > 1000) { tl = now; time_refresh_label(); }
   if (_login_pending && now > _login_deadline) {
     _login_pending = false;
     snprintf(_login_msg, sizeof(_login_msg), "No reply. Wrong password, or node out of reach.");
