@@ -594,6 +594,30 @@ void UITask::onDiscoveredContact(ContactInfo& contact, bool is_new, uint8_t path
 #endif
     toast("Clock set from the mesh");
   }
+  // Boot time may be stale (RTC chip or ESP32 backup). Until the phone, the user or the mesh confirms it,
+  // collect advert-clock offsets heard since boot; once two agree, adopt their time, even backward.
+  static int32_t offs[8]; static int noffs = 0;
+  if (!the_mesh.clock_trusted && ts > CLOCK_SEED + 7 * 86400UL && ts < 2208988800UL) {
+    offs[noffs % 8] = (int32_t)(ts - now_epoch());
+    Serial.printf("MeshSyd: advert clock offset %ld s (%s)\n", (long)offs[noffs % 8], contact.name);
+    noffs++;
+    int n = noffs < 8 ? noffs : 8;
+    if (n >= 3) {
+      int32_t srt[8]; memcpy(srt, offs, sizeof(srt));
+      for (int i = 1; i < n; i++) { int32_t v = srt[i]; int j = i - 1; while (j >= 0 && srt[j] > v) { srt[j + 1] = srt[j]; j--; } srt[j + 1] = v; }
+      int32_t med = srt[n / 2];
+      int agree = 0;
+      for (int i = 0; i < n; i++) if (abs(srt[i] - med) <= 120) agree++;
+      if (agree >= 3) {
+        if (abs(med) > 60) {
+          rtc_clock.setCurrentTime(now_epoch() + med);
+          Serial.printf("MeshSyd: clock corrected by %ld s from mesh (%d nodes)\n", (long)med, agree);
+          toast("Clock corrected from the mesh");
+        }
+        the_mesh.clock_trusted = true;
+      }
+    }
+  }
   _dirty = true;
 }
 
@@ -1139,7 +1163,7 @@ void UITask::buildHome() {
   lv_obj_t* clk = col(body, lv_pct(100), LV_SIZE_CONTENT, 2);
   lv_obj_set_flex_align(clk, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
   char hm[8]; fmt_hm(clock_valid() ? now_epoch() : 0, hm, sizeof(hm));
-  label(clk, hm, &inter_46b, C_TXT);
+  label(clk, hm, &inter_46b, the_mesh.clock_trusted ? C_TXT : C_TXT3);
   char date[40];
   if (clock_valid()) {
     static const char* WD[] = { "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday" };
@@ -1150,6 +1174,10 @@ void UITask::buildHome() {
     snprintf(date, sizeof(date), "Clock not set \xE2\x80\x94 waiting for phone or mesh");
   }
   label(clk, date, &F12, C_TXT2);
+  if (clock_valid() && !the_mesh.clock_trusted) {
+    lv_obj_t* uc = label(clk, "Time from last boot \xE2\x80\x94 not confirmed yet", &F10, C_AMBER_TXT);
+    lv_obj_set_style_text_font(uc, &inter_10, 0);
+  }
   // radio parameters: freq · bandwidth · SF · CR · TX power
   {
     char bw[12];
@@ -2395,6 +2423,7 @@ static void time_refresh_label() {
 static void time_adjust_cb(lv_event_t* e) {
   int32_t d = (int32_t)(intptr_t)lv_event_get_user_data(e);
   rtc_clock.setCurrentTime(now_epoch() + d);
+  the_mesh.clock_trusted = true;
   time_refresh_label();
 }
 
@@ -2438,12 +2467,12 @@ static void time_modal() {
     pressable(mb, C_KEY);
     lv_obj_add_event_cb(mb, [](lv_event_t* e) {
       int32_t o = 0; int k = 0;
-      if (mesh_time_offset(&o, &k)) rtc_clock.setCurrentTime(now_epoch() + o);
+      if (mesh_time_offset(&o, &k)) { rtc_clock.setCurrentTime(now_epoch() + o); the_mesh.clock_trusted = true; }
       time_refresh_label();
       g_ui->toast("Clock set to mesh time");
     }, LV_EVENT_CLICKED, nullptr);
   }
-  lv_obj_t* hint = label(card, "The phone app can only move the clock forward. Use this if it runs ahead.", &F10, C_TXT2);
+  lv_obj_t* hint = label(card, "After a reboot the phone app or mesh can correct the clock either way. Once confirmed, the app only moves it forward.", &F10, C_TXT2);
   lv_obj_set_style_text_font(hint, &inter_10, 0);
   lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
   lv_obj_set_width(hint, lv_pct(100));
@@ -2586,6 +2615,7 @@ void UITask::begin(DisplayDriver* disp, SensorManager* sensors, NodePrefs* node_
   _sensors = sensors;
   _node_prefs = node_prefs;
   loadPrefs();
+  if (rtc_hw_trusted) the_mesh.clock_trusted = true;   // a running DS3231 beats drifting repeater clocks
   loadPasswords();
 
   F10 = inter_10;   F10.fallback = &icons_14;

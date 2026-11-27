@@ -218,6 +218,9 @@ public:
   int  uiSendCli(const uint8_t* pub_key, const char* text, uint32_t& est_timeout);
   // "Heard N repeats": the next transmitted packet of this payload type is tagged, and
   // every later reception of the same packet hash counts as an echo from a repeater.
+  // Boot time (RTC chip or ESP32 backup) may be stale: until something authoritative sets it, let the
+  // phone app move the clock backward too.
+  bool clock_trusted = false;
   void uiTrackNextTx(uint32_t ui_tag, uint8_t payload_type) { ui_track_tag = ui_tag; ui_track_type = payload_type; }
 
   void savePrefs() {

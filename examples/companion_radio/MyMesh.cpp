@@ -1290,8 +1290,9 @@ void MyMesh::handleCmdFrame(size_t len) {
     uint32_t secs;
     memcpy(&secs, &cmd_frame[1], 4);
     uint32_t curr = getRTCClock()->getCurrentTime();
-    if (secs >= curr) {
+    if (secs >= curr || (!clock_trusted && secs > 1772323200UL)) {
       getRTCClock()->setCurrentTime(secs);
+      clock_trusted = true;
       writeOKFrame();
     } else {
       writeErrFrame(ERR_CODE_ILLEGAL_ARG);

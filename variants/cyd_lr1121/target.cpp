@@ -40,9 +40,29 @@ static const Module::RfSwitchMode_t rfswitch_table[] = {
   END_OF_MODE_TABLE,
 };
 
+bool rtc_hw_trusted = false;
+
 bool radio_init() {
   fallback_clock.begin();
   rtc_clock.begin(Wire);   // I2C on GPIO21/22 (started in ESP32Board::begin)
+  {
+    Serial.print("I2C scan (SDA 21, SCL 22):");
+    int found = 0;
+    for (uint8_t a = 0x08; a < 0x78; a++) {
+      Wire.beginTransmission(a);
+      if (Wire.endTransmission() == 0) { Serial.printf(" 0x%02X", a); found++; }
+    }
+    Serial.println(found ? "" : " none");
+    // DS3231 sanity: status reg 0x0F (bit7 OSF = oscillator stopped / lost power), temp regs 0x11-0x12
+    Wire.beginTransmission(0x68); Wire.write(0x0F);
+    if (Wire.endTransmission() == 0 && Wire.requestFrom(0x68, 4) == 4) {
+      uint8_t st = Wire.read(); Wire.read(); int8_t th = (int8_t)Wire.read(); uint8_t tl = Wire.read();
+      rtc_hw_trusted = !(st & 0x80) && rtc_clock.getCurrentTime() > 1772323200UL + 7 * 86400UL;
+      Serial.printf("RTC 0x68: status 0x%02X (OSF %d), temp %.2f C\n", st, (st >> 7) & 1, th + (tl >> 6) * 0.25f);
+    }
+    Serial.printf("Clock at boot: %lu (fallback %lu)%s\n", (unsigned long)rtc_clock.getCurrentTime(),
+                  (unsigned long)fallback_clock.getCurrentTime(), rtc_hw_trusted ? " trusted (RTC)" : " unconfirmed");
+  }
 
   spi.begin(P_LORA_SCLK, P_LORA_MISO, P_LORA_MOSI);
   int status = radio.begin(LORA_FREQ, LORA_BW, LORA_SF, LORA_CR, RADIOLIB_LR11X0_LORA_SYNC_WORD_PRIVATE,
