@@ -64,7 +64,9 @@ void BaseChatMesh::bootstrapRTCfromContacts() {
       latest = contacts[i].lastmod;
     }
   }
-  if (latest != 0) {
+  // Only move the clock forward: with a hardware RTC (or a clock restored across a reset) the current time
+  // is already later than the last contact update, and rewinding it would lose real time.
+  if (latest != 0 && latest + 1 > getRTCClock()->getCurrentTime()) {
     getRTCClock()->setCurrentTime(latest + 1);
   }
 }

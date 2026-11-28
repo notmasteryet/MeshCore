@@ -18,6 +18,29 @@ It works on its own and alongside the official MeshCore phone apps over Bluetoot
 | Button | GPIO0 (BOOT) |
 | I2C (optional RTC) | SDA 21, SCL 22. A DS3231 / PCF8563 / RV3028 is detected automatically |
 
+### Bill of materials
+
+| Part | Notes |
+|---|---|
+| ESP32-2432S028R "Cheap Yellow Display" | ESP32-D0WD-V3, 4 MB flash, 2.8" 240×320 ST7789, XPT2046 touch, CH340 USB. Modified: backlight moved from GPIO21 to GPIO27 to free GPIO21 for I2C |
+| Semtech LR1121 module | 3.0 V TCXO, RF switch on DIO5/DIO6, wired to VSPI as above |
+| Antenna for your band | e.g. 868 or 915 MHz. Don't transmit without one connected |
+| 1-cell Li-ion / LiPo, 3.7 V | Battery sense through a 1.48 MΩ + 1 MΩ divider to GPIO34 |
+| **DS3231 RTC module** (optional, recommended) | I2C address 0x68 on SDA 21 / SCL 22, 3.3 V. Keeps time with the power off, so the clock is right at boot without the phone. Modules with pull-ups need no extra parts. Backup power from a supercap (charged from 3.3 V, holds time for hours to days off power) or a coin cell (LIR2032 if the module charges it, otherwise CR2032) |
+| Micro-USB **data** cable | |
+
+With a DS3231 fitted, the serial log at boot shows:
+
+```
+I2C scan (SDA 21, SCL 22): 0x68
+RTC 0x68: status 0x08 (OSF 0), temp 27.00 C
+Clock at boot: 1795820357 (fallback 1772323200) trusted (RTC)
+```
+
+`OSF 0` means the oscillator has kept running. A DS3231 that has never been set, or has lost its
+backup battery, shows `OSF 1` and the clock stays unconfirmed until the phone app sets it once.
+Older DS1307 chips use the same address but aren't supported: they need 5 V and drift.
+
 The pin map comes from the Meshtastic CYD port
 (`notmasteryet/firmware`, `variants/esp32/cyd`). The board definition is in `variants/cyd_lr1121/`.
 
@@ -99,8 +122,10 @@ pio pkg exec -p tool-esptoolpy -- esptool.py --port <PORT> write_flash 0 backup-
 
 1. The splash screen is followed by **Home**.
 2. The Bluetooth PIN shows on Home until a phone connects. Pair the MeshCore app with it.
-3. The app sets the region radio preset and the clock. Without the phone or an RTC, the clock is
-   taken from the first advert heard on the mesh. Fine-tune it in **Settings › Clock**.
+3. The app sets the region radio preset and the clock. With a DS3231 the time is stored there and
+   is right on every boot. Without an RTC, the clock shows dimmed as *not confirmed* after a reboot
+   and is taken from the mesh (three nodes that agree) until the phone sets it. Fine-tune it in
+   **Settings › Clock**.
 4. Set your **time zone** in Settings.
 
 ## Using it
@@ -129,7 +154,8 @@ SPIFFS. Saved passwords are stored in plain text.
 | Board not detected | Charge-only cable, or a hub in the way. Use a data cable, directly. |
 | "Loading" flashing / reboot loop | Not enough power on USB (hub, weak port). Plug in directly. |
 | Repeater login gets no reply | Wrong password, **or** the clock is behind: repeaters drop logins older than the last accepted one. Connect the phone app (it sets the clock), then retry. |
-| Clock a few minutes off after a reflash | The clock stands still while flashing. The phone app moves it forward; **Settings › Clock** can move it either way. |
+| Clock a few minutes off after a reflash | Without an RTC the clock stands still while flashing. Connect the phone app (until confirmed it can move the clock either way), or use **Settings › Clock**. Fitting a DS3231 fixes this for good. |
+| Old time shown at boot | An RTC chip that was never set. Connect the phone app once; the time is written to the chip. |
 | Touch dead after the screen sleeps | Fixed in this branch; update. |
 
 ## Development notes
