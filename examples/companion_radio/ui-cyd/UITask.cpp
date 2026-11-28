@@ -436,8 +436,7 @@ void UITask::wake() {
   _last_touch = millis();
   if (!_screen_on) {
     _screen_on = true;
-    display.gfx()->setBrightness(_prefs.brightness);
-    _dirty = true;
+    _wake_pending = true;   // loop() redraws first, then lights the backlight (no stale frame)
   }
 }
 
@@ -2654,6 +2653,14 @@ void UITask::begin(DisplayDriver* disp, SensorManager* sensors, NodePrefs* node_
 #endif
 }
 
+// Screens with typed input or an open modal: a rebuild would throw away what's being edited.
+bool UITask::isTypingScreen() const {
+  return _screen == CydScreen::Compose || _screen == CydScreen::EditName || _screen == CydScreen::Login ||
+         _screen == CydScreen::CliInput || _screen == CydScreen::PathInput ||
+         _screen == CydScreen::ChannelName || _screen == CydScreen::ChannelKey ||
+         _screen == CydScreen::ContactName || _screen == CydScreen::ContactKey || g_modal;
+}
+
 void UITask::loop() {
   lv_timer_handler();
   unsigned long now = millis();
@@ -2670,6 +2677,17 @@ void UITask::loop() {
   } else if (ev == BUTTON_EVENT_LONG_PRESS) {
     wake();
     show(CydScreen::Home);
+  }
+
+  // Screen just woke: bring the content up to date (clock, "ago" labels, new messages) and push it to
+  // the panel before the backlight comes on, so the old frame from when it went dark is never shown.
+  if (_wake_pending) {
+    _wake_pending = false;
+    if (!isTypingScreen()) show(_screen);
+    else if (g_time_lbl) time_refresh_label();
+    _last_minute = now_epoch() / 60;
+    lv_refr_now(NULL);
+    display.gfx()->setBrightness(_prefs.brightness);
   }
 
   if (now < _next_tick) return;
@@ -2735,11 +2753,7 @@ void UITask::loop() {
 
   // rebuild on data changes, but never under the user's finger or while typing
   static unsigned long last_build = 0;
-  bool typing = _screen == CydScreen::Compose || _screen == CydScreen::EditName || _screen == CydScreen::Login ||
-                _screen == CydScreen::CliInput || _screen == CydScreen::PathInput ||
-                _screen == CydScreen::ChannelName || _screen == CydScreen::ChannelKey ||
-                _screen == CydScreen::ContactName || _screen == CydScreen::ContactKey || g_modal;
-  if (_dirty && _screen_on && !typing && now - _last_touch > 600 && now - last_build > 400) {
+  if (_dirty && _screen_on && !isTypingScreen() && now - _last_touch > 600 && now - last_build > 400) {
     last_build = now;
     show(_screen);
   }

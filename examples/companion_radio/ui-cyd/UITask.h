@@ -74,6 +74,8 @@ class UITask : public AbstractUITask {
   bool      _swallow_touch = false;
   unsigned long _last_touch = 0, _next_tick = 0, _toast_until = 0;
   uint32_t  _last_minute = 0;
+  bool      _wake_pending = false;
+  bool      isTypingScreen() const;
 
   // contact detail + ping
   uint8_t   _detail_pub[32];
